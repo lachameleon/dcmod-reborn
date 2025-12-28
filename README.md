@@ -73,7 +73,7 @@ A **gear icon** appears next to the chat input box when the plugin is enabled. C
 1. Click **"Add Client"** in quick access menu
 2. Configure each client:
    - **Name**: A friendly name for this client 
-   - **Port**: WebSocket port (Each client must have a unique port number, you change the port via the [minecraft command](#minecraft-mod-configuration))
+   - **Port**: WebSocket port
    - **Channel ID**: The Discord channel ID to bridge with this client
    - **Enabled**: Toggle to enable/disable this client connection
    - **Forward to Discord**: Toggle to enable/disable forwarding Minecraft chat to Discord
