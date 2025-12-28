@@ -2,7 +2,7 @@
  * @name MinecraftChat
  * @author Aurick
  * @authorId 1348025017233047634
- * @version 1.0.3
+ * @version 1.0.2
  * @description Bridge Discord channel chat with multiple Minecraft clients via WebSocket
  * @website https://github.com/aurickk/Discord-Chat-Integration/
  * @source https://github.com/aurickk/Discord-Chat-Integration/blob/main/betterdiscord-plugin
@@ -43,7 +43,7 @@ module.exports = class MinecraftChat {
     getName() { return "MinecraftChat"; }
     getAuthor() { return "Aurick"; }
     getDescription() { return "Bridge Discord channel chat with multiple Minecraft clients via WebSocket"; }
-    getVersion() { return "1.0.3"; }
+    getVersion() { return "1.0.2"; }
 
     load() {
         // Load settings
