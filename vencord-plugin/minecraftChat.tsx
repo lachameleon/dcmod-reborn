@@ -186,9 +186,9 @@ async function executeAutomationActions(automation: AutomationConfig, triggering
     for (const action of automation.actions) {
         if (signal?.aborted) {
             log(`Automation "${automation.name}" was stopped`);
-            return;
-        }
-        
+        return;
+    }
+
         switch (action.type) {
             case "message":
                 if (!action.content?.trim()) break;
@@ -428,9 +428,9 @@ function refreshClientStatus(clientId: string) {
     } else {
         disconnectWebSocket(clientId);
         if (client.enabled) connectWebSocket(client);
-    }
+        }
     window?.dispatchEvent(new CustomEvent("minecraft-status-update"));
-}
+    }
 
 const hasMultipleClientsForChannel = (channelId: string) => 
     getClients().filter(c => c.channelId === channelId && c.enabled && c.forwardToDiscord).length > 1;
@@ -483,7 +483,7 @@ function handleMinecraftMessage(data: any, clientId: string) {
             let plainText = (author !== "System" && author !== "Minecraft") ? `${author}: ${content}` : content;
             if (hasMultipleClientsForChannel(freshClient.channelId)) plainText = `[${freshClient.name}] ${plainText}`;
             const messageText = plainText.includes("\n") ? `\`\`\`\n${plainText}\n\`\`\`` : `\`${plainText}\``;
-            
+        
             if (!messageQueues.has(clientId)) messageQueues.set(clientId, []);
         messageQueues.get(clientId)!.push({ plainText, messageText, channelId: freshClient.channelId, clientName: freshClient.name });
         processMessageQueue(clientId);
@@ -646,7 +646,7 @@ function sendToTargetClients(author: string, content: string, targetClientIds: s
         const group = client.syncGroup || "A";
         if (!clientsBySyncGroup.has(group)) clientsBySyncGroup.set(group, []);
         clientsBySyncGroup.get(group)!.push(client);
-    }
+        }
     
     for (const [syncGroup, groupClients] of clientsBySyncGroup) {
         let targetTick = syncGroupTargetTicks?.get(syncGroup) ?? calculateTargetTickForSyncGroup(syncGroup);
@@ -750,7 +750,7 @@ function handleDiscordMessage(event: any) {
     if (messageId) {
         processedDiscordMessageIds.add(messageId);
         pruneSet(processedDiscordMessageIds, 500);
-    }
+        }
     
     if (message.nonce && sentMessageNonces.has(message.nonce)) {
         sentMessageNonces.delete(message.nonce);
@@ -1840,7 +1840,7 @@ export default definePlugin({
                 const hasAnyConnection = clients.some(c => {
                     const ws = wsConnections.get(c.id);
                     return ws && ws.readyState === WebSocket.OPEN && c.enabled;
-                });
+                    });
                 setHasConnection(hasAnyConnection);
             };
             
