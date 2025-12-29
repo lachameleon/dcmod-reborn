@@ -2,6 +2,8 @@ package discord.chat.mc.command;
 
 import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
+import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.suggestion.SuggestionProvider;
 import discord.chat.mc.chat.ChatHandler;
 import discord.chat.mc.config.ModConfig;
 import discord.chat.mc.websocket.DiscordWebSocketServer;
@@ -10,9 +12,22 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallba
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.minecraft.client.Minecraft;
 import net.minecraft.commands.CommandBuildContext;
+import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.network.chat.Component;
 
+import java.util.List;
+
 public class DiscordCommand {
+    
+    private static final SuggestionProvider<FabricClientCommandSource> AUTOMATION_SUGGESTIONS = (context, builder) -> {
+        DiscordWebSocketServer server = DiscordWebSocketServer.getInstance();
+        if (server != null && server.isRunning()) {
+            server.requestAutomationsList();
+            List<String> names = server.getCachedAutomationNames();
+            return SharedSuggestionProvider.suggest(names, builder);
+        }
+        return builder.buildFuture();
+    };
     
     public static void register() {
         ClientCommandRegistrationCallback.EVENT.register(DiscordCommand::registerCommands);
@@ -62,6 +77,20 @@ public class DiscordCommand {
                         return 1;
                     })
                 )
+                .then(ClientCommandManager.literal("run")
+                    .then(ClientCommandManager.argument("automation", StringArgumentType.greedyString())
+                        .suggests(AUTOMATION_SUGGESTIONS)
+                        .executes(context -> {
+                            String automationName = StringArgumentType.getString(context, "automation");
+                            runAutomation(context.getSource(), automationName);
+                            return 1;
+                        })
+                    )
+                    .executes(context -> {
+                        listAutomations(context.getSource());
+                        return 1;
+                    })
+                )
         );
     }
     
@@ -99,7 +128,6 @@ public class DiscordCommand {
         ModConfig config = ModConfig.getInstance();
         int oldPort = config.getPort();
         
-        // Only proceed if port actually changed
         if (oldPort == port) {
             source.sendFeedback(Component.literal(
                 String.format("§7Port is already set to §f%d§r", port)
@@ -114,7 +142,6 @@ public class DiscordCommand {
             String.format("§aPort changed from §f%d§a to §f%d§r", oldPort, port)
         ));
         
-        // Automatically reconnect with the new port
         reconnect(source);
     }
     
@@ -130,12 +157,8 @@ public class DiscordCommand {
         DiscordWebSocketServer.createInstance(port);
         DiscordWebSocketServer newServer = DiscordWebSocketServer.getInstance();
         
-        // Set up message handler
-        newServer.setMessageHandler(message -> {
-            discord.chat.mc.chat.ChatHandler.getInstance().handleDiscordMessage(message);
-        });
+        newServer.setMessageHandler(message -> ChatHandler.getInstance().handleDiscordMessage(message));
         
-        // Start in a new thread
         new Thread(() -> {
             try {
                 newServer.start();
@@ -189,36 +212,11 @@ public class DiscordCommand {
         long clientTimeMs = System.currentTimeMillis();
         
         String playerName = "Unknown";
-        int ping = -1;
-        boolean isSingleplayer = client.isSingleplayer();
-        
         if (client.player != null) {
             try {
                 playerName = client.player.getName().getString();
             } catch (Exception e) {
                 try { playerName = client.player.getGameProfile().getName(); } catch (Exception ignored) {}
-            }
-            
-            if (!isSingleplayer) {
-                try {
-                    var connection = client.getConnection();
-                    if (connection != null) {
-                        for (var playerInfo : connection.getOnlinePlayers()) {
-                            if (playerInfo.getProfile().getId().equals(client.player.getUUID())) {
-                                ping = playerInfo.getLatency();
-                                break;
-                            }
-                        }
-                        if (ping == -1) {
-                            try {
-                                var playerInfo = client.player.connection.getPlayerInfo(client.player.getUUID());
-                                if (playerInfo != null) ping = playerInfo.getLatency();
-                            } catch (Exception ignored) {}
-                            }
-                        }
-                } catch (Exception ignored) {}
-            } else {
-                ping = 0;
             }
         }
         
@@ -230,17 +228,6 @@ public class DiscordCommand {
         message.append(String.format("§7Player: §f%s§r\n", playerName));
         message.append(String.format("§7Server Tick: §f%d§r\n", serverTick));
         message.append(String.format("§7Client Time: §f%d§r ms\n", clientTimeMs));
-        
-        if (isSingleplayer) {
-            message.append("§7Ping: §fN/A§r (Singleplayer)\n");
-        } else if (ping == -1) {
-            message.append("§7Ping: §cUnable to retrieve§r\n");
-        } else if (ping == 0) {
-            message.append(String.format("§7Ping: §e%d§r ms §7(may be incorrect)§r\n", ping));
-        } else {
-            message.append(String.format("§7Ping: §f%d§r ms\n", ping));
-        }
-        
         message.append(String.format("§7Sync Group: §f%s§r\n", syncGroup != null ? syncGroup : "none"));
         
         if (execInfo != null) {
@@ -258,5 +245,74 @@ public class DiscordCommand {
         }
         
         source.sendFeedback(Component.literal(message.toString()));
+    }
+    
+    private static void runAutomation(FabricClientCommandSource source, String automationName) {
+        DiscordWebSocketServer server = DiscordWebSocketServer.getInstance();
+        
+        if (server == null || !server.isRunning()) {
+            source.sendError(Component.literal("§cWebSocket server is not running. Use §f/discordchat reconnect§c to start it."));
+            return;
+        }
+        
+        if (server.getConnectionCount() == 0) {
+            source.sendError(Component.literal("§cNo Discord clients connected."));
+            return;
+        }
+        
+        source.sendFeedback(Component.literal(String.format("§6Running automation: §f%s§6...§r", automationName)));
+        server.runAutomation(automationName);
+        
+        new Thread(() -> {
+            try {
+                Thread.sleep(500);
+                String result = server.getAndClearAutomationResult();
+                if (result != null) {
+                    Minecraft client = Minecraft.getInstance();
+                    if (client != null && client.player != null) {
+                        client.execute(() -> client.player.displayClientMessage(Component.literal(result), false));
+                    }
+                }
+            } catch (InterruptedException ignored) {}
+        }, "Automation-Result-Wait").start();
+    }
+    
+    private static void listAutomations(FabricClientCommandSource source) {
+        DiscordWebSocketServer server = DiscordWebSocketServer.getInstance();
+        
+        if (server == null || !server.isRunning()) {
+            source.sendError(Component.literal("§cWebSocket server is not running."));
+            return;
+        }
+        
+        if (server.getConnectionCount() == 0) {
+            source.sendError(Component.literal("§cNo Discord clients connected."));
+            return;
+        }
+        
+        server.requestAutomationsList();
+        
+        new Thread(() -> {
+            try {
+                Thread.sleep(300);
+                List<String> names = server.getCachedAutomationNames();
+                Minecraft client = Minecraft.getInstance();
+                if (client != null && client.player != null) {
+                    client.execute(() -> {
+                        if (names.isEmpty()) {
+                            client.player.displayClientMessage(Component.literal("§7No automations configured in Discord plugin."), false);
+                        } else {
+                            StringBuilder sb = new StringBuilder();
+                            sb.append("§6=== Available Automations ===§r\n");
+                            for (String name : names) {
+                                sb.append("§7• §f").append(name).append("§r\n");
+                            }
+                            sb.append("§7Use §f/discordchat run <name>§7 to run an automation.");
+                            client.player.displayClientMessage(Component.literal(sb.toString()), false);
+                        }
+                    });
+                }
+            } catch (InterruptedException ignored) {}
+        }, "Automations-List-Wait").start();
     }
 }

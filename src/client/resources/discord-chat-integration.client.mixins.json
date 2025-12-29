@@ -3,8 +3,7 @@
 	"package": "discord.chat.mc.mixin.client",
 	"compatibilityLevel": "JAVA_21",
 	"client": [
-		"ChatComponentMixin",
-		"LocalPlayerMixin"
+		"ChatComponentMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

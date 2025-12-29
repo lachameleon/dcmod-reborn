@@ -7,7 +7,6 @@ import net.minecraft.client.Minecraft;
 
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.ConcurrentHashMap;
 
 public class ChatHandler {
     private static ChatHandler instance;
@@ -18,7 +17,6 @@ public class ChatHandler {
     private static final long SENT_FROM_DISCORD_WINDOW_MS = 3000;
     private final ConcurrentLinkedQueue<DiscordWebSocketServer.ChatMessage> tickSyncQueue = new ConcurrentLinkedQueue<>();
     
-    private volatile boolean tickSyncEnabled = false;
     private volatile String lastSyncGroup = "none";
     private volatile long lastTargetTick = -1;
     private volatile long lastExecutionTick = -1;
@@ -81,12 +79,6 @@ public class ChatHandler {
         tickListenerRegistered = true;
     }
     
-    public void setTickSyncEnabled(boolean enabled) {
-        this.tickSyncEnabled = enabled;
-    }
-    
-    public boolean isTickSyncEnabled() { return tickSyncEnabled; }
-    public int getTickSyncQueueSize() { return tickSyncQueue.size(); }
     public String getLastSyncGroup() { return lastSyncGroup; }
     
     public void setLastSyncGroup(String syncGroup) {

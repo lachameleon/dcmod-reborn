@@ -14,8 +14,10 @@ import org.java_websocket.exceptions.InvalidDataException;
 import org.java_websocket.server.WebSocketServer;
 
 import java.net.InetSocketAddress;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -30,6 +32,8 @@ public class DiscordWebSocketServer extends WebSocketServer {
     private final Set<WebSocket> connections = Collections.synchronizedSet(new HashSet<>());
     private Consumer<ChatMessage> messageHandler;
     private boolean running = false;
+    private List<String> cachedAutomationNames = new ArrayList<>();
+    private String lastAutomationResult = null;
     
     private final ExecutorService messageExecutor = Executors.newFixedThreadPool(2, r -> {
         Thread t = new Thread(r, "Discord-WebSocket-Message-Processor");
@@ -195,12 +199,17 @@ public class DiscordWebSocketServer extends WebSocketServer {
                     JsonObject pong = new JsonObject();
                     pong.addProperty("type", "pong");
                     conn.send(GSON.toJson(pong));
-                } else if ("tick_sync_enable".equals(type)) {
-                    ChatHandler.getInstance().setTickSyncEnabled(true);
-                } else if ("tick_sync_disable".equals(type)) {
-                    ChatHandler.getInstance().setTickSyncEnabled(false);
                 } else if ("request_player_info".equals(type)) {
                     sendPlayerInfo(conn);
+                } else if ("automations_list".equals(type)) {
+                    if (json.has("automations") && json.get("automations").isJsonArray()) {
+                        cachedAutomationNames.clear();
+                        json.get("automations").getAsJsonArray().forEach(el -> cachedAutomationNames.add(el.getAsString()));
+                    }
+                } else if ("automation_result".equals(type)) {
+                    boolean success = json.has("success") && json.get("success").getAsBoolean();
+                    String msg = json.has("message") ? json.get("message").getAsString() : "";
+                    lastAutomationResult = success ? "§a" + msg : "§c" + msg;
                 }
             } catch (Exception e) {
                 DiscordChatIntegration.LOGGER.error("Error parsing WebSocket message: {}", e.getMessage());
@@ -294,6 +303,39 @@ public class DiscordWebSocketServer extends WebSocketServer {
     public int getConnectionCount() { return connections.size(); }
     public boolean isRunning() { return running; }
     
+    public void requestAutomationsList() {
+        JsonObject json = new JsonObject();
+        json.addProperty("type", "get_automations");
+        String jsonString = GSON.toJson(json);
+        synchronized (connections) {
+            for (WebSocket conn : connections) {
+                if (conn.isOpen()) conn.send(jsonString);
+            }
+        }
+    }
+    
+    public void runAutomation(String automationName) {
+        JsonObject json = new JsonObject();
+        json.addProperty("type", "run_automation");
+        json.addProperty("name", automationName);
+        String jsonString = GSON.toJson(json);
+        synchronized (connections) {
+            for (WebSocket conn : connections) {
+                if (conn.isOpen()) conn.send(jsonString);
+            }
+        }
+    }
+    
+    public List<String> getCachedAutomationNames() {
+        return new ArrayList<>(cachedAutomationNames);
+    }
+    
+    public String getAndClearAutomationResult() {
+        String result = lastAutomationResult;
+        lastAutomationResult = null;
+        return result;
+    }
+    
     public void stopServer() {
         try {
             running = false;
@@ -327,14 +369,6 @@ public class DiscordWebSocketServer extends WebSocketServer {
         public final boolean tickSync;
         public final String syncGroup;
         public final long targetTick;
-        
-        public ChatMessage(String author, String content, String messageId) {
-            this(author, content, messageId, false, "none", -1);
-        }
-        
-        public ChatMessage(String author, String content, String messageId, boolean tickSync, String syncGroup) {
-            this(author, content, messageId, tickSync, syncGroup, -1);
-        }
         
         public ChatMessage(String author, String content, String messageId, boolean tickSync, String syncGroup, long targetTick) {
             this.author = author;
