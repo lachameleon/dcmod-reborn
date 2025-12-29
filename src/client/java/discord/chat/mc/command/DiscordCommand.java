@@ -91,6 +91,12 @@ public class DiscordCommand {
                         return 1;
                     })
                 )
+                .then(ClientCommandManager.literal("stop")
+                    .executes(context -> {
+                        stopAutomations(context.getSource());
+                        return 1;
+                    })
+                )
         );
     }
     
@@ -275,6 +281,36 @@ public class DiscordCommand {
                 }
             } catch (InterruptedException ignored) {}
         }, "Automation-Result-Wait").start();
+    }
+    
+    private static void stopAutomations(FabricClientCommandSource source) {
+        DiscordWebSocketServer server = DiscordWebSocketServer.getInstance();
+        
+        if (server == null || !server.isRunning()) {
+            source.sendError(Component.literal("§cWebSocket server is not running."));
+            return;
+        }
+        
+        if (server.getConnectionCount() == 0) {
+            source.sendError(Component.literal("§cNo Discord clients connected."));
+            return;
+        }
+        
+        source.sendFeedback(Component.literal("§6Stopping automations...§r"));
+        server.stopAutomations();
+        
+        new Thread(() -> {
+            try {
+                Thread.sleep(300);
+                String result = server.getAndClearAutomationResult();
+                if (result != null) {
+                    Minecraft client = Minecraft.getInstance();
+                    if (client != null && client.player != null) {
+                        client.execute(() -> client.player.displayClientMessage(Component.literal(result), false));
+                    }
+                }
+            } catch (InterruptedException ignored) {}
+        }, "Automation-Stop-Wait").start();
     }
     
     private static void listAutomations(FabricClientCommandSource source) {

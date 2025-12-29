@@ -57,6 +57,8 @@ const messageQueues = new Map<string, Array<{ plainText: string; messageText: st
 const isSendingMessage = new Map<string, boolean>();
 const clientTicks = new Map<string, number>();
 const delayedMessages: DelayedMessage[] = [];
+const runningAutomations = new Map<string, AbortController>();
+let automationInstanceCounter = 0;
 
 let chatDelayEnabled = false;
 let isSubscribed = false;
@@ -177,11 +179,16 @@ function saveAutomations(automations: AutomationConfig[]) {
     }
 }
 
-async function executeAutomationActions(automation: AutomationConfig, triggeringClientId: string) {
+async function executeAutomationActions(automation: AutomationConfig, triggeringClientId: string, signal?: AbortSignal) {
     const clients = getClients();
     log(`Executing ${automation.actions.length} action(s) for automation "${automation.name}"`);
     
     for (const action of automation.actions) {
+        if (signal?.aborted) {
+            log(`Automation "${automation.name}" was stopped`);
+            return;
+        }
+        
         switch (action.type) {
             case "message":
                 if (!action.content?.trim()) break;
@@ -206,7 +213,16 @@ async function executeAutomationActions(automation: AutomationConfig, triggering
                 log(`Chat delay is now: ${chatDelayEnabled}`);
                 break;
             case "wait":
-                if (action.waitTime && action.waitTime > 0) await new Promise(r => setTimeout(r, action.waitTime));
+                if (action.waitTime && action.waitTime > 0) {
+                    await new Promise<void>((resolve, reject) => {
+                        const timeout = setTimeout(resolve, action.waitTime);
+                        signal?.addEventListener("abort", () => {
+                            clearTimeout(timeout);
+                            reject(new Error("Aborted"));
+                        });
+                    }).catch(() => {});
+                    if (signal?.aborted) return;
+                }
                 break;
             case "discord_message":
                 if (action.content?.trim()) await sendLogToDiscord(action.content);
@@ -237,7 +253,13 @@ function checkAutomations(messageContent: string, clientId: string) {
         if (matches) {
             log(`Automation "${automation.name}" triggered with ${automation.actions.length} action(s): ${automation.actions.map(a => a.type).join(', ')}`);
             automationLastTriggered.set(automation.id, now);
-            executeAutomationActions(automation, clientId);
+            
+            const instanceId = `${automation.id}_${++automationInstanceCounter}`;
+            const abortController = new AbortController();
+            runningAutomations.set(instanceId, abortController);
+            executeAutomationActions(automation, clientId, abortController.signal).finally(() => {
+                runningAutomations.delete(instanceId);
+            });
         }
     }
 }
@@ -250,8 +272,26 @@ function runAutomationByName(name: string, clientId: string | null = null): bool
         return false;
     }
     log(`Running automation by name: "${automation.name}"`);
-    executeAutomationActions(automation, clientId || "manual");
+    
+    const instanceId = `${automation.id}_${++automationInstanceCounter}`;
+    const abortController = new AbortController();
+    runningAutomations.set(instanceId, abortController);
+    executeAutomationActions(automation, clientId || "manual", abortController.signal).finally(() => {
+        runningAutomations.delete(instanceId);
+    });
     return true;
+}
+
+function stopAllAutomations(): number {
+    const count = runningAutomations.size;
+    if (count > 0) {
+        log(`Stopping ${count} running automation(s)`);
+        for (const [id, controller] of runningAutomations) {
+            controller.abort();
+        }
+        runningAutomations.clear();
+    }
+    return count;
 }
 
 function getAutomationNames(): string[] {
@@ -401,7 +441,7 @@ function handleMinecraftMessage(data: any, clientId: string) {
     
     switch (data.type) {
         case "connection_status": {
-            const newPlayerName = data.playerName;
+        const newPlayerName = data.playerName;
             if (!newPlayerName || newPlayerName === "Unknown" || !newPlayerName.trim()) return;
             const previousPlayerName = playerNames.get(clientId);
             const isNewOrReconnect = disconnectMessageSent.get(clientId) === true || !playerNames.has(clientId);
@@ -413,9 +453,9 @@ function handleMinecraftMessage(data: any, clientId: string) {
             break;
         }
         case "player_info": {
-            const newPlayerName = data.name;
-            if (newPlayerName && newPlayerName !== "Unknown") {
-                playerNames.set(clientId, newPlayerName);
+        const newPlayerName = data.name;
+        if (newPlayerName && newPlayerName !== "Unknown") {
+            playerNames.set(clientId, newPlayerName);
                 window?.dispatchEvent(new CustomEvent("minecraft-status-update"));
             }
             break;
@@ -424,19 +464,19 @@ function handleMinecraftMessage(data: any, clientId: string) {
             if (typeof data.tick === "number" && data.tick >= 0) clientTicks.set(clientId, data.tick);
             break;
         case "minecraft_message": {
-            const author = data.author || "Minecraft";
-            const content = data.content || "";
-            if (!content) return;
-            
+        const author = data.author || "Minecraft";
+        const content = data.content || "";
+        if (!content) return;
+        
             checkAutomations(content, clientId);
             
             const freshClient = getClients().find(c => c.id === clientId);
             if (!freshClient?.forwardToDiscord || !freshClient.channelId) return;
             
-            const playerName = playerNames.get(clientId);
-            if (playerName) {
+        const playerName = playerNames.get(clientId);
+        if (playerName) {
                 const isOwnMessage = content.startsWith(`<${playerName}>`) ||
-                    (author !== "System" && author !== "Minecraft" && author === playerName);
+                (author !== "System" && author !== "Minecraft" && author === playerName);
                 if (isOwnMessage) return;
             }
             
@@ -445,8 +485,8 @@ function handleMinecraftMessage(data: any, clientId: string) {
             const messageText = plainText.includes("\n") ? `\`\`\`\n${plainText}\n\`\`\`` : `\`${plainText}\``;
             
             if (!messageQueues.has(clientId)) messageQueues.set(clientId, []);
-            messageQueues.get(clientId)!.push({ plainText, messageText, channelId: freshClient.channelId, clientName: freshClient.name });
-            processMessageQueue(clientId);
+        messageQueues.get(clientId)!.push({ plainText, messageText, channelId: freshClient.channelId, clientName: freshClient.name });
+        processMessageQueue(clientId);
             break;
         }
         case "run_automation": {
@@ -464,6 +504,20 @@ function handleMinecraftMessage(data: any, clientId: string) {
                         }));
                     } catch {}
                 }
+            }
+            break;
+        }
+        case "stop_automation": {
+            const count = stopAllAutomations();
+            const ws = wsConnections.get(clientId);
+            if (ws?.readyState === WebSocket.OPEN) {
+                try {
+                    ws.send(JSON.stringify({
+                        type: "automation_result",
+                        success: true,
+                        message: count > 0 ? `Stopped ${count} running automation(s)` : "No automations were running"
+                    }));
+                } catch {}
             }
             break;
         }
@@ -520,7 +574,7 @@ async function processMessageQueue(clientId: string) {
 function sendToMinecraft(author: string, content: string, channelId: string, messageId?: string) {
     const matchingClients = getClients().filter(c => c.channelId === channelId && c.enabled);
     if (matchingClients.length === 0) return;
-
+    
     const clientsBySyncGroup = new Map<string, ClientConfig[]>();
     for (const client of matchingClients) {
         const syncGroup = client.syncGroup || "A";
@@ -580,8 +634,8 @@ function calculateTargetTickForSyncGroup(syncGroup: string): number {
         return -1;
     }
     return maxTick + TICK_SYNC_BUFFER;
-}
-
+    }
+    
 function sendToTargetClients(author: string, content: string, targetClientIds: string[], syncGroupTargetTicks?: Map<string, number>) {
     const clients = getClients();
     const targets = clients.filter(c => targetClientIds.includes(c.id) && c.enabled);
@@ -624,7 +678,7 @@ function flushDelayedMessages() {
         if (msg.targetClientIds?.length) {
             sendToTargetClients(msg.author, msg.content, msg.targetClientIds, syncGroupTargetTicks);
         } else {
-            sendToMinecraftWithSyncGroups(msg.author, msg.content, msg.channelId, msg.messageId, syncGroupTargetTicks);
+        sendToMinecraftWithSyncGroups(msg.author, msg.content, msg.channelId, msg.messageId, syncGroupTargetTicks);
         }
     }
 }
@@ -917,68 +971,68 @@ function SettingsModalContent({ onClose }: { onClose: () => void }) {
             
             {/* Chat Delay Section - Advanced Feature */}
             {advancedFeatures && (
-                <div style={{ 
-                    marginBottom: "16px", 
-                    padding: "12px", 
-                    backgroundColor: chatDelay ? "#3ba55c20" : "#2b2d31", 
-                    borderRadius: "8px", 
-                    border: `1px solid ${chatDelay ? "#3ba55c" : "#4f545c"}` 
-                }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
-                        <div style={{ fontWeight: "600", color: "#fff" }}>Chat Delay</div>
-                        {chatDelay && (
-                            <span style={{ fontSize: "12px", color: "#faa61a", fontWeight: "500" }}>
-                                {delayedCount} message{delayedCount !== 1 ? "s" : ""} queued
-                            </span>
-                        )}
-                    </div>
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+            <div style={{ 
+                marginBottom: "16px", 
+                padding: "12px", 
+                backgroundColor: chatDelay ? "#3ba55c20" : "#2b2d31", 
+                borderRadius: "8px", 
+                border: `1px solid ${chatDelay ? "#3ba55c" : "#4f545c"}` 
+            }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "10px" }}>
+                    <div style={{ fontWeight: "600", color: "#fff" }}>Chat Delay</div>
+                    {chatDelay && (
+                        <span style={{ fontSize: "12px", color: "#faa61a", fontWeight: "500" }}>
+                            {delayedCount} message{delayedCount !== 1 ? "s" : ""} queued
+                        </span>
+                    )}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "8px" }}>
+                    <button 
+                        onClick={() => {
+                            const newState = toggleChatDelay();
+                            setChatDelay(newState);
+                            setDelayedCount(delayedMessages.length);
+                        }} 
+                        style={{ 
+                            padding: "8px 16px", 
+                            color: "#fff", 
+                            backgroundColor: chatDelay ? "#ed4245" : "#3ba55c", 
+                            border: "none", 
+                            borderRadius: "4px", 
+                            cursor: "pointer", 
+                            fontWeight: "500",
+                            minWidth: "140px"
+                        }}
+                    >
+                        {chatDelay ? "Disable & Send" : "Enable Delay"}
+                    </button>
+                    {chatDelay && delayedCount > 0 && (
                         <button 
                             onClick={() => {
-                                const newState = toggleChatDelay();
-                                setChatDelay(newState);
-                                setDelayedCount(delayedMessages.length);
+                                clearDelayedMessages();
+                                setDelayedCount(0);
                             }} 
                             style={{ 
                                 padding: "8px 16px", 
                                 color: "#fff", 
-                                backgroundColor: chatDelay ? "#ed4245" : "#3ba55c", 
+                                backgroundColor: "#4f545c", 
                                 border: "none", 
                                 borderRadius: "4px", 
                                 cursor: "pointer", 
-                                fontWeight: "500",
-                                minWidth: "140px"
+                                fontWeight: "500"
                             }}
                         >
-                            {chatDelay ? "Disable & Send" : "Enable Delay"}
+                            Clear Queue
                         </button>
-                        {chatDelay && delayedCount > 0 && (
-                            <button 
-                                onClick={() => {
-                                    clearDelayedMessages();
-                                    setDelayedCount(0);
-                                }} 
-                                style={{ 
-                                    padding: "8px 16px", 
-                                    color: "#fff", 
-                                    backgroundColor: "#4f545c", 
-                                    border: "none", 
-                                    borderRadius: "4px", 
-                                    cursor: "pointer", 
-                                    fontWeight: "500"
-                                }}
-                            >
-                                Clear Queue
-                            </button>
-                        )}
-                    </div>
-                    <div style={{ fontSize: "12px", color: "#b5bac1" }}>
-                        {chatDelay 
-                            ? "Messages are being queued. Disable to send all at the same game tick."
-                            : "Enable to queue messages for tick-perfect execution across multiple clients."
-                        }
-                    </div>
+                    )}
                 </div>
+                <div style={{ fontSize: "12px", color: "#b5bac1" }}>
+                    {chatDelay 
+                        ? "Messages are being queued. Disable to send all at the same game tick."
+                        : "Enable to queue messages for tick-perfect execution across multiple clients."
+                    }
+                </div>
+            </div>
             )}
             
             {/* Client Management */}
@@ -1046,30 +1100,30 @@ function SettingsModalContent({ onClose }: { onClose: () => void }) {
                                 Forward to Discord
                             </label>
                             {advancedFeatures && (
-                                <label style={{ display: "flex", alignItems: "center", gap: "6px", color: "#b5bac1", fontSize: "13px" }}>
-                                    Sync Group:
-                                    <select 
-                                        value={client.syncGroup || "A"} 
-                                        onChange={(e) => updateClient(client.id, { syncGroup: e.target.value as ClientConfig["syncGroup"] }, true)}
-                                        style={{ 
-                                            padding: "4px 8px", 
-                                            color: "#fff", 
-                                            backgroundColor: "#1e1f22", 
-                                            border: "1px solid #4f545c", 
-                                            borderRadius: "4px", 
-                                            cursor: "pointer",
-                                            fontSize: "13px"
-                                        }}
-                                    >
-                                        <option value="none">None</option>
-                                        <option value="A">A</option>
-                                        <option value="B">B</option>
-                                        <option value="C">C</option>
-                                        <option value="D">D</option>
-                                        <option value="E">E</option>
-                                        <option value="F">F</option>
-                                    </select>
-                                </label>
+                            <label style={{ display: "flex", alignItems: "center", gap: "6px", color: "#b5bac1", fontSize: "13px" }}>
+                                Sync Group:
+                                <select 
+                                    value={client.syncGroup || "A"} 
+                                    onChange={(e) => updateClient(client.id, { syncGroup: e.target.value as ClientConfig["syncGroup"] }, true)}
+                                    style={{ 
+                                        padding: "4px 8px", 
+                                        color: "#fff", 
+                                        backgroundColor: "#1e1f22", 
+                                        border: "1px solid #4f545c", 
+                                        borderRadius: "4px", 
+                                        cursor: "pointer",
+                                        fontSize: "13px"
+                                    }}
+                                >
+                                    <option value="none">None</option>
+                                    <option value="A">A</option>
+                                    <option value="B">B</option>
+                                    <option value="C">C</option>
+                                    <option value="D">D</option>
+                                    <option value="E">E</option>
+                                    <option value="F">F</option>
+                                </select>
+                            </label>
                             )}
                         </div>
                         <div style={{ fontSize: "12px", color: "#b5bac1", marginTop: "4px", display: "flex", alignItems: "center", gap: "8px" }}>
@@ -1175,7 +1229,13 @@ function AutomationsManager({ clients }: { clients: ClientConfig[] }) {
             return;
         }
         log(`Manually running automation: "${automation.name}"`);
-        executeAutomationActions(automation, "manual");
+        
+        const instanceId = `${automation.id}_${++automationInstanceCounter}`;
+        const abortController = new AbortController();
+        runningAutomations.set(instanceId, abortController);
+        executeAutomationActions(automation, "manual", abortController.signal).finally(() => {
+            runningAutomations.delete(instanceId);
+        });
     };
 
     const addAction = (automationId: string, actionType: AutomationAction["type"]) => {
@@ -1245,6 +1305,15 @@ function AutomationsManager({ clients }: { clients: ClientConfig[] }) {
                     style={{ padding: "8px 16px", color: "#fff", backgroundColor: "#5865f2", border: "none", borderRadius: "4px", cursor: "pointer", fontWeight: "500" }}
                 >
                     + Add Automation
+                </button>
+                <button
+                    onClick={() => {
+                        const count = stopAllAutomations();
+                        log(count > 0 ? `Stopped ${count} automation(s)` : "No automations running");
+                    }}
+                    style={{ padding: "8px 16px", color: "#fff", backgroundColor: "#ed4245", border: "none", borderRadius: "4px", cursor: "pointer", fontWeight: "500" }}
+                >
+                    Stop All
                 </button>
             </div>
             
@@ -1764,7 +1833,7 @@ export default definePlugin({
         const [hasConnection, setHasConnection] = useState(false);
         const [clientCount, setClientCount] = useState(0);
         
-        useEffect(() => {
+            useEffect(() => {
             const checkStatus = () => {
                 const clients = getClients();
                 setClientCount(clients.length);
@@ -1777,13 +1846,13 @@ export default definePlugin({
             
             checkStatus();
             const interval = setInterval(checkStatus, 1000);
-            return () => clearInterval(interval);
-        }, []);
-        
-        return (
+                return () => clearInterval(interval);
+            }, []);
+
+            return (
             <div style={{ padding: "16px", color: "#ffffff" }}>
                 {/* Status Display with Gear Icon */}
-                <div style={{ 
+                    <div style={{ 
                     padding: "12px", 
                     backgroundColor: hasConnection ? "#3ba55c20" : "#ed424520",
                     borderRadius: "8px", 
@@ -1803,35 +1872,35 @@ export default definePlugin({
                             <span style={{ fontWeight: "600" }}>
                                 {hasConnection ? "Connected" : "Disconnected"}
                             </span>
-                        </div>
+                    </div>
                         <div style={{ fontSize: "13px", color: "#b5bac1" }}>
                             {clientCount} client{clientCount !== 1 ? "s" : ""} configured
                         </div>
-                    </div>
+                        </div>
                     {/* Gear Icon Button */}
-                    <button
+                            <button
                         onClick={() => openSettingsModal()}
-                        style={{
+                                style={{
                             background: "none",
-                            border: "none",
-                            cursor: "pointer",
+                                    border: "none",
+                                    cursor: "pointer",
                             padding: "8px",
                             borderRadius: "4px",
-                            display: "flex",
-                            alignItems: "center",
+                                    display: "flex",
+                                    alignItems: "center",
                             justifyContent: "center"
-                        }}
+                                }}
                         onMouseEnter={(e) => e.currentTarget.style.backgroundColor = "rgba(255,255,255,0.1)"}
                         onMouseLeave={(e) => e.currentTarget.style.backgroundColor = "transparent"}
                         title="Open Client Settings"
-                    >
+                            >
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" style={{ color: "#b5bac1" }}>
                             <path fill="currentColor" d={GEAR_ICON_PATH}/>
                         </svg>
-                    </button>
+                            </button>
+                        </div>
                 </div>
-            </div>
-        );
+            );
     },
 
     toolboxActions: {

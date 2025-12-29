@@ -38,6 +38,8 @@ module.exports = class MinecraftChat {
         this.boundHandleDiscordMessage = this.handleDiscordMessage.bind(this);
         this.chatDelayEnabled = false;
         this.delayedMessages = [];
+        this.runningAutomations = new Map();
+        this.automationInstanceCounter = 0;
         this.TICK_SYNC_BUFFER = 5;
         
         // Cached webpack modules
@@ -236,8 +238,15 @@ module.exports = class MinecraftChat {
 
     // ============== AUTOMATIONS ==============
 
-    async executeAutomationActions(automation, triggeringClientId) {
+    async executeAutomationActions(automation, triggeringClientId, signal) {
+        this.log(`Executing ${automation.actions.length} action(s) for automation "${automation.name}"`);
+        
         for (const action of automation.actions) {
+            if (signal?.aborted) {
+                this.log(`Automation "${automation.name}" was stopped`);
+                return;
+            }
+            
             switch (action.type) {
                 case "message":
                     if (action.content?.trim()) {
@@ -263,7 +272,16 @@ module.exports = class MinecraftChat {
                     this.log(`Chat delay is now: ${this.chatDelayEnabled}`);
                     break;
                 case "wait":
-                    if (action.waitTime > 0) await new Promise(r => setTimeout(r, action.waitTime));
+                    if (action.waitTime > 0) {
+                        await new Promise((resolve, reject) => {
+                            const timeout = setTimeout(resolve, action.waitTime);
+                            signal?.addEventListener("abort", () => {
+                                clearTimeout(timeout);
+                                reject(new Error("Aborted"));
+                            });
+                        }).catch(() => {});
+                        if (signal?.aborted) return;
+                    }
                     break;
                 case "discord_message":
                     if (action.content?.trim()) await this.sendLogToDiscord(action.content);
@@ -290,9 +308,27 @@ module.exports = class MinecraftChat {
             if (matches) {
                 this.log(`Automation "${automation.name}" triggered with ${automation.actions.length} action(s): ${automation.actions.map(a => a.type).join(', ')}`);
                 this.automationLastTriggered.set(automation.id, now);
-                this.executeAutomationActions(automation, clientId);
+                
+                const instanceId = `${automation.id}_${++this.automationInstanceCounter}`;
+                const abortController = new AbortController();
+                this.runningAutomations.set(instanceId, abortController);
+                this.executeAutomationActions(automation, clientId, abortController.signal).finally(() => {
+                    this.runningAutomations.delete(instanceId);
+                });
             }
         }
+    }
+
+    stopAllAutomations() {
+        const count = this.runningAutomations.size;
+        if (count > 0) {
+            this.log(`Stopping ${count} running automation(s)`);
+            for (const [id, controller] of this.runningAutomations) {
+                controller.abort();
+            }
+            this.runningAutomations.clear();
+        }
+        return count;
     }
 
     // ============== DISCORD MESSAGING ==============
@@ -486,6 +522,20 @@ module.exports = class MinecraftChat {
                             }));
                         } catch {}
                     }
+                }
+                break;
+            }
+            case "stop_automation": {
+                const count = this.stopAllAutomations();
+                const ws = this.wsConnections.get(clientId);
+                if (ws?.readyState === WebSocket.OPEN) {
+                    try {
+                        ws.send(JSON.stringify({
+                            type: "automation_result",
+                            success: true,
+                            message: count > 0 ? `Stopped ${count} running automation(s)` : "No automations were running"
+                        }));
+                    } catch {}
                 }
                 break;
             }
@@ -801,8 +851,9 @@ module.exports = class MinecraftChat {
         return `
             <div style="margin-top:24px;border-top:1px solid #4f545c;padding-top:16px;">
                 <div style="margin-bottom:12px;font-weight:600;color:#fff;font-size:16px;">Automations</div>
-                <div style="margin-bottom:12px;">
+                <div style="margin-bottom:12px;display:flex;gap:8px;">
                     <button class="add-automation-btn" style="padding:8px 16px;color:#fff;background:#5865f2;border:none;border-radius:4px;cursor:pointer;font-weight:500;">+ Add Automation</button>
+                    <button class="stop-all-automations-btn" style="padding:8px 16px;color:#fff;background:#ed4245;border:none;border-radius:4px;cursor:pointer;font-weight:500;">Stop All</button>
                 </div>
                 <div class="automations-container">${automationsHTML}</div>
             </div>`;
@@ -951,6 +1002,10 @@ module.exports = class MinecraftChat {
 
         $('.add-client-btn').addEventListener('click', () => this.addClient(modalOverlay));
         $('.add-automation-btn')?.addEventListener('click', () => this.addAutomation(modalOverlay));
+        $('.stop-all-automations-btn')?.addEventListener('click', () => {
+            const count = this.stopAllAutomations();
+            this.log(count > 0 ? `Stopped ${count} automation(s)` : "No automations running");
+        });
 
         this.setupClientEventListeners(modalOverlay);
         this.setupAutomationEventListeners(modalOverlay);
@@ -1187,7 +1242,13 @@ module.exports = class MinecraftChat {
             return;
         }
         this.log(`Manually running automation: "${automation.name}"`);
-        this.executeAutomationActions(automation, null);
+        
+        const instanceId = `${automation.id}_${++this.automationInstanceCounter}`;
+        const abortController = new AbortController();
+        this.runningAutomations.set(instanceId, abortController);
+        this.executeAutomationActions(automation, null, abortController.signal).finally(() => {
+            this.runningAutomations.delete(instanceId);
+        });
     }
 
     runAutomationByName(name, clientId = null) {
@@ -1195,7 +1256,6 @@ module.exports = class MinecraftChat {
         const automation = automations.find(a => a.name.toLowerCase() === name.toLowerCase());
         if (!automation) {
             this.log(`Automation not found by name: "${name}"`);
-            // Send error back to Minecraft
             if (clientId) {
                 const ws = this.wsConnections.get(clientId);
                 if (ws?.readyState === WebSocket.OPEN) {
@@ -1205,7 +1265,13 @@ module.exports = class MinecraftChat {
             return false;
         }
         this.log(`Running automation by name: "${automation.name}"`);
-        this.executeAutomationActions(automation, clientId);
+        
+        const instanceId = `${automation.id}_${++this.automationInstanceCounter}`;
+        const abortController = new AbortController();
+        this.runningAutomations.set(instanceId, abortController);
+        this.executeAutomationActions(automation, clientId, abortController.signal).finally(() => {
+            this.runningAutomations.delete(instanceId);
+        });
         return true;
     }
 
@@ -1316,3 +1382,4 @@ module.exports = class MinecraftChat {
             </div>`;
     }
 };
+

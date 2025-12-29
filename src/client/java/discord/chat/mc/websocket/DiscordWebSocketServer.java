@@ -326,6 +326,17 @@ public class DiscordWebSocketServer extends WebSocketServer {
         }
     }
     
+    public void stopAutomations() {
+        JsonObject json = new JsonObject();
+        json.addProperty("type", "stop_automation");
+        String jsonString = GSON.toJson(json);
+        synchronized (connections) {
+            for (WebSocket conn : connections) {
+                if (conn.isOpen()) conn.send(jsonString);
+            }
+        }
+    }
+    
     public List<String> getCachedAutomationNames() {
         return new ArrayList<>(cachedAutomationNames);
     }
