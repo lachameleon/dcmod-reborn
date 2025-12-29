@@ -20,6 +20,7 @@ interface DelayedMessage {
     content: string;
     channelId: string;
     messageId?: string;
+    targetClientIds?: string[];
 }
 
 interface AutomationAction {
@@ -40,6 +41,9 @@ interface AutomationConfig {
     cooldown: number;
 }
 
+const GEAR_ICON_PATH = "M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z";
+const TICK_SYNC_BUFFER = 5;
+
 const automationLastTriggered = new Map<string, number>();
 const wsConnections = new Map<string, WebSocket>();
 const reconnectIntervals = new Map<string, ReturnType<typeof setInterval>>();
@@ -51,12 +55,19 @@ const forwardedToDiscordMessages = new Set<string>();
 const processedDiscordMessageIds = new Set<string>();
 const messageQueues = new Map<string, Array<{ plainText: string; messageText: string; channelId: string; clientName: string }>>();
 const isSendingMessage = new Map<string, boolean>();
+const clientTicks = new Map<string, number>();
+const delayedMessages: DelayedMessage[] = [];
 
 let chatDelayEnabled = false;
-const delayedMessages: DelayedMessage[] = [];
-const clientTicks = new Map<string, number>();
-const TICK_SYNC_BUFFER = 5;
 let isSubscribed = false;
+
+function pruneSet<T>(set: Set<T>, keepLast: number) {
+    if (set.size > keepLast * 2) {
+        const entries = Array.from(set);
+        set.clear();
+        entries.slice(-keepLast).forEach(item => set.add(item));
+    }
+}
 
 const settings = definePluginSettings({
     autoConnect: {
@@ -124,14 +135,8 @@ async function sendLogToDiscord(content: string) {
 }
 
 function getConnectedClientsList(): string {
-    const clients = getClients();
-    const connected = clients.filter(c => {
-        const ws = wsConnections.get(c.id);
-        return ws && ws.readyState === WebSocket.OPEN;
-    });
-    
+    const connected = getClients().filter(c => wsConnections.get(c.id)?.readyState === WebSocket.OPEN);
     if (connected.length === 0) return "None";
-    
     return connected.map(c => {
         const name = playerNames.get(c.id);
         return name ? `• ${c.name} (${name})` : `• ${c.name}`;
@@ -179,49 +184,32 @@ async function executeAutomationActions(automation: AutomationConfig, triggering
     for (const action of automation.actions) {
         switch (action.type) {
             case "message":
-                if (action.content?.trim()) {
-                    const targetIds = action.targetClientIds?.length ? action.targetClientIds : automation.clientIds;
-                    const targets = clients.filter(c => targetIds.includes(c.id) && c.enabled);
-                    
-                    for (const client of targets) {
-                        const ws = wsConnections.get(client.id);
-                        if (ws?.readyState === WebSocket.OPEN) {
-                            try {
-                                ws.send(JSON.stringify({
-                                    type: "discord_message",
-                                    author: "Automation",
-                                    content: action.content,
-                                    tickSync: false,
-                                }));
-                            } catch (e) {
-                                console.error(`[MinecraftChat] Error sending to ${client.name}:`, e);
-                            }
-                        }
-                    }
+                if (!action.content?.trim()) break;
+                const targetIds = action.targetClientIds?.length ? action.targetClientIds : automation.clientIds;
+                if (chatDelayEnabled) {
+                    queueDelayedMessage("Automation", action.content, "", undefined, targetIds);
+                } else {
+                    sendToTargetClients("Automation", action.content, targetIds);
                 }
                 break;
-                
             case "enable_delay":
-                if (!chatDelayEnabled) chatDelayEnabled = true;
+                log(`Executing enable_delay (currently: ${chatDelayEnabled})`);
+                chatDelayEnabled = true;
+                log(`Chat delay is now: ${chatDelayEnabled}`);
                 break;
-                
             case "disable_delay":
+                log(`Executing disable_delay (currently: ${chatDelayEnabled}, queued: ${delayedMessages.length})`);
                 if (chatDelayEnabled) {
                     chatDelayEnabled = false;
                     if (delayedMessages.length > 0) flushDelayedMessages();
                 }
+                log(`Chat delay is now: ${chatDelayEnabled}`);
                 break;
-                
             case "wait":
-                if (action.waitTime && action.waitTime > 0) {
-                    await new Promise(resolve => setTimeout(resolve, action.waitTime));
-                }
+                if (action.waitTime && action.waitTime > 0) await new Promise(r => setTimeout(r, action.waitTime));
                 break;
-                
             case "discord_message":
-                if (action.content?.trim()) {
-                    await sendLogToDiscord(action.content);
-                }
+                if (action.content?.trim()) await sendLogToDiscord(action.content);
                 break;
         }
     }
@@ -247,11 +235,27 @@ function checkAutomations(messageContent: string, clientId: string) {
             : trimmedContent.includes(trigger);
         
         if (matches) {
-            log(`Automation "${automation.name}" triggered`);
+            log(`Automation "${automation.name}" triggered with ${automation.actions.length} action(s): ${automation.actions.map(a => a.type).join(', ')}`);
             automationLastTriggered.set(automation.id, now);
             executeAutomationActions(automation, clientId);
         }
     }
+}
+
+function runAutomationByName(name: string, clientId: string | null = null): boolean {
+    const automations = getAutomations();
+    const automation = automations.find(a => a.name.toLowerCase() === name.toLowerCase());
+    if (!automation) {
+        log(`Automation not found by name: "${name}"`);
+        return false;
+    }
+    log(`Running automation by name: "${automation.name}"`);
+    executeAutomationActions(automation, clientId || "manual");
+    return true;
+}
+
+function getAutomationNames(): string[] {
+    return getAutomations().map(a => a.name);
 }
 
 function connectWebSocket(client: ClientConfig, attemptedPort?: number): void {
@@ -371,108 +375,110 @@ function disconnectAllWebSockets() {
 
 function getChannelName(channelId: string): string | null {
     if (!channelId?.trim()) return null;
-    try {
-        const channel = ChannelStore.getChannel(channelId);
-        return channel?.name || null;
-    } catch (e) {
-        return null;
-    }
+    try { return ChannelStore.getChannel(channelId)?.name || null; } catch { return null; }
 }
 
 function refreshClientStatus(clientId: string) {
-    const clients = getClients();
-    const client = clients.find(c => c.id === clientId);
+    const client = getClients().find(c => c.id === clientId);
     if (!client) return;
     
     const ws = wsConnections.get(clientId);
-    
     if (ws?.readyState === WebSocket.OPEN) {
-        try {
-            ws.send(JSON.stringify({ type: "request_player_info" }));
-        } catch (e) {}
+        try { ws.send(JSON.stringify({ type: "request_player_info" })); } catch {}
     } else {
         disconnectWebSocket(clientId);
         if (client.enabled) connectWebSocket(client);
     }
-    
-    if (typeof window !== "undefined") {
-        window.dispatchEvent(new CustomEvent("minecraft-status-update"));
-    }
+    window?.dispatchEvent(new CustomEvent("minecraft-status-update"));
 }
 
-function hasMultipleClientsForChannel(channelId: string): boolean {
-    const clients = getClients();
-    return clients.filter(c => c.channelId === channelId && c.enabled && c.forwardToDiscord).length > 1;
-}
+const hasMultipleClientsForChannel = (channelId: string) => 
+    getClients().filter(c => c.channelId === channelId && c.enabled && c.forwardToDiscord).length > 1;
 
 function handleMinecraftMessage(data: any, clientId: string) {
-    const clients = getClients();
-    const client = clients.find(c => c.id === clientId);
+    const client = getClients().find(c => c.id === clientId);
     if (!client) return;
     
-    if (data.type === "connection_status") {
-        const newPlayerName = data.playerName;
-        const isValid = newPlayerName && newPlayerName !== "Unknown" && newPlayerName.trim() !== "";
-        
-        if (isValid) {
+    switch (data.type) {
+        case "connection_status": {
+            const newPlayerName = data.playerName;
+            if (!newPlayerName || newPlayerName === "Unknown" || !newPlayerName.trim()) return;
             const previousPlayerName = playerNames.get(clientId);
             const isNewOrReconnect = disconnectMessageSent.get(clientId) === true || !playerNames.has(clientId);
-            
             playerNames.set(clientId, newPlayerName);
-            
             if (isNewOrReconnect || previousPlayerName !== newPlayerName) {
                 disconnectMessageSent.set(clientId, false);
                 sendLogToDiscord(`✅ **Client Connected**\n**Client:** ${client.name}\n**Player:** ${newPlayerName}\n\n**Connected Clients:**\n${getConnectedClientsList()}`);
             }
+            break;
         }
-    } else if (data.type === "player_info") {
-        const newPlayerName = data.name;
-        if (newPlayerName && newPlayerName !== "Unknown") {
-            playerNames.set(clientId, newPlayerName);
-            if (typeof window !== "undefined") {
-                window.dispatchEvent(new CustomEvent("minecraft-status-update"));
+        case "player_info": {
+            const newPlayerName = data.name;
+            if (newPlayerName && newPlayerName !== "Unknown") {
+                playerNames.set(clientId, newPlayerName);
+                window?.dispatchEvent(new CustomEvent("minecraft-status-update"));
             }
+            break;
         }
-    } else if (data.type === "tick_update") {
-        if (typeof data.tick === "number" && data.tick >= 0) {
-            clientTicks.set(clientId, data.tick);
+        case "tick_update":
+            if (typeof data.tick === "number" && data.tick >= 0) clientTicks.set(clientId, data.tick);
+            break;
+        case "minecraft_message": {
+            const author = data.author || "Minecraft";
+            const content = data.content || "";
+            if (!content) return;
+            
+            checkAutomations(content, clientId);
+            
+            const freshClient = getClients().find(c => c.id === clientId);
+            if (!freshClient?.forwardToDiscord || !freshClient.channelId) return;
+            
+            const playerName = playerNames.get(clientId);
+            if (playerName) {
+                const isOwnMessage = content.startsWith(`<${playerName}>`) ||
+                    (author !== "System" && author !== "Minecraft" && author === playerName);
+                if (isOwnMessage) return;
+            }
+            
+            let plainText = (author !== "System" && author !== "Minecraft") ? `${author}: ${content}` : content;
+            if (hasMultipleClientsForChannel(freshClient.channelId)) plainText = `[${freshClient.name}] ${plainText}`;
+            const messageText = plainText.includes("\n") ? `\`\`\`\n${plainText}\n\`\`\`` : `\`${plainText}\``;
+            
+            if (!messageQueues.has(clientId)) messageQueues.set(clientId, []);
+            messageQueues.get(clientId)!.push({ plainText, messageText, channelId: freshClient.channelId, clientName: freshClient.name });
+            processMessageQueue(clientId);
+            break;
         }
-    } else if (data.type === "minecraft_message") {
-        const author = data.author || "Minecraft";
-        const content = data.content || "";
-        if (!content) return;
-        
-        checkAutomations(content, clientId);
-        
-        const freshClients = getClients();
-        const freshClient = freshClients.find(c => c.id === clientId);
-        if (!freshClient) return;
-        
-        if (!freshClient.forwardToDiscord || !freshClient.channelId) return;
-        
-        const playerName = playerNames.get(clientId);
-        if (playerName) {
-            const isOwnMessage = content.startsWith(`<${playerName}>`) ||
-                (author !== "System" && author !== "Minecraft" && author === playerName);
-            if (isOwnMessage) return;
+        case "run_automation": {
+            const automationName = data.name;
+            if (automationName) {
+                const success = runAutomationByName(automationName, clientId);
+                const ws = wsConnections.get(clientId);
+                if (ws?.readyState === WebSocket.OPEN) {
+                    try {
+                        ws.send(JSON.stringify({
+                            type: "automation_result",
+                            name: automationName,
+                            success,
+                            message: success ? `Automation "${automationName}" executed` : `Automation "${automationName}" not found`
+                        }));
+                    } catch {}
+                }
+            }
+            break;
         }
-        
-        let plainText = (author !== "System" && author !== "Minecraft") 
-            ? `${author}: ${content}` : content;
-        
-        if (hasMultipleClientsForChannel(freshClient.channelId)) {
-            plainText = `[${freshClient.name}] ${plainText}`;
+        case "get_automations": {
+            const ws = wsConnections.get(clientId);
+            if (ws?.readyState === WebSocket.OPEN) {
+                try {
+                    ws.send(JSON.stringify({
+                        type: "automations_list",
+                        automations: getAutomationNames()
+                    }));
+                } catch {}
+            }
+            break;
         }
-        
-        const messageText = plainText.includes("\n") 
-            ? `\`\`\`\n${plainText}\n\`\`\`` 
-            : `\`${plainText}\``;
-        
-        if (!messageQueues.has(clientId)) {
-            messageQueues.set(clientId, []);
-        }
-        messageQueues.get(clientId)!.push({ plainText, messageText, channelId: freshClient.channelId, clientName: freshClient.name });
-        processMessageQueue(clientId);
     }
 }
 
@@ -493,13 +499,7 @@ async function processMessageQueue(clientId: string) {
             
             const messageKey = `${message.channelId}:${message.plainText}`;
             forwardedToDiscordMessages.add(messageKey);
-            
-            if (forwardedToDiscordMessages.size > 100) {
-                const entries = Array.from(forwardedToDiscordMessages);
-                forwardedToDiscordMessages.clear();
-                entries.slice(-50).forEach(key => forwardedToDiscordMessages.add(key));
-            }
-            
+            pruneSet(forwardedToDiscordMessages, 50);
             setTimeout(() => forwardedToDiscordMessages.delete(messageKey), 5000);
             
             const nonce = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
@@ -518,16 +518,13 @@ async function processMessageQueue(clientId: string) {
 }
 
 function sendToMinecraft(author: string, content: string, channelId: string, messageId?: string) {
-    const clients = getClients();
-    const matchingClients = clients.filter(c => c.channelId === channelId && c.enabled);
+    const matchingClients = getClients().filter(c => c.channelId === channelId && c.enabled);
     if (matchingClients.length === 0) return;
 
     const clientsBySyncGroup = new Map<string, ClientConfig[]>();
     for (const client of matchingClients) {
         const syncGroup = client.syncGroup || "A";
-        if (!clientsBySyncGroup.has(syncGroup)) {
-            clientsBySyncGroup.set(syncGroup, []);
-        }
+        if (!clientsBySyncGroup.has(syncGroup)) clientsBySyncGroup.set(syncGroup, []);
         clientsBySyncGroup.get(syncGroup)!.push(client);
     }
     
@@ -535,9 +532,7 @@ function sendToMinecraft(author: string, content: string, channelId: string, mes
     for (const [syncGroup, groupClients] of clientsBySyncGroup) {
         if (syncGroup !== "none" && groupClients.length >= 2) {
             const targetTick = calculateTargetTickForSyncGroup(syncGroup);
-            if (targetTick >= 0) {
-                syncGroupTargetTicks.set(syncGroup, targetTick);
-            }
+            if (targetTick >= 0) syncGroupTargetTicks.set(syncGroup, targetTick);
         }
     }
 
@@ -548,16 +543,9 @@ function sendToMinecraft(author: string, content: string, channelId: string, mes
                 const syncGroup = client.syncGroup || "A";
                 const targetTick = syncGroupTargetTicks.get(syncGroup);
                 const useTickSync = targetTick !== undefined && targetTick >= 0;
-                
-                const message: any = {
-                    type: "discord_message",
-                    author, content,
-                    tickSync: useTickSync,
-                    syncGroup,
-                };
+                const message: any = { type: "discord_message", author, content, tickSync: useTickSync, syncGroup };
                 if (useTickSync) message.targetTick = targetTick;
                 if (messageId) message.messageId = messageId;
-                
                 ws.send(JSON.stringify(message));
             } catch (e) {
                 console.error(`[MinecraftChat] Error sending to ${client.name}:`, e);
@@ -566,19 +554,12 @@ function sendToMinecraft(author: string, content: string, channelId: string, mes
     }
 }
 
-function isChatDelayEnabled(): boolean {
-    return chatDelayEnabled;
-}
-
-function getDelayedMessageCount(): number {
-    return delayedMessages.length;
-}
+const isChatDelayEnabled = () => chatDelayEnabled;
+const getDelayedMessageCount = () => delayedMessages.length;
 
 function toggleChatDelay(): boolean {
     chatDelayEnabled = !chatDelayEnabled;
-    if (!chatDelayEnabled && delayedMessages.length > 0) {
-        flushDelayedMessages();
-    }
+    if (!chatDelayEnabled && delayedMessages.length > 0) flushDelayedMessages();
     log(`Chat delay ${chatDelayEnabled ? "enabled" : "disabled"}`);
     return chatDelayEnabled;
 }
@@ -586,24 +567,50 @@ function toggleChatDelay(): boolean {
 function calculateTargetTickForSyncGroup(syncGroup: string): number {
     if (syncGroup === "none") return -1;
     
-    const clients = getClients();
-    const syncGroupClients = clients.filter(c => c.enabled && (c.syncGroup || "A") === syncGroup);
+    const syncGroupClients = getClients().filter(c => c.enabled && (c.syncGroup || "A") === syncGroup);
     if (syncGroupClients.length === 0) return -1;
     
-    let maxTick = -1;
-    for (const client of syncGroupClients) {
+    const maxTick = syncGroupClients.reduce((max, client) => {
         const tick = clientTicks.get(client.id);
-        if (tick !== undefined && tick >= 0) {
-            maxTick = Math.max(maxTick, tick);
-        }
-    }
+        return tick !== undefined && tick >= 0 ? Math.max(max, tick) : max;
+    }, -1);
     
     if (maxTick < 0) {
         log(`No tick data for sync group ${syncGroup}`);
         return -1;
     }
-    
     return maxTick + TICK_SYNC_BUFFER;
+}
+
+function sendToTargetClients(author: string, content: string, targetClientIds: string[], syncGroupTargetTicks?: Map<string, number>) {
+    const clients = getClients();
+    const targets = clients.filter(c => targetClientIds.includes(c.id) && c.enabled);
+    if (targets.length === 0) return;
+    
+    const clientsBySyncGroup = new Map<string, ClientConfig[]>();
+    for (const client of targets) {
+        const group = client.syncGroup || "A";
+        if (!clientsBySyncGroup.has(group)) clientsBySyncGroup.set(group, []);
+        clientsBySyncGroup.get(group)!.push(client);
+    }
+    
+    for (const [syncGroup, groupClients] of clientsBySyncGroup) {
+        let targetTick = syncGroupTargetTicks?.get(syncGroup) ?? calculateTargetTickForSyncGroup(syncGroup);
+        syncGroupTargetTicks?.set(syncGroup, targetTick);
+        
+        for (const client of groupClients) {
+            const ws = wsConnections.get(client.id);
+            if (ws?.readyState === WebSocket.OPEN) {
+                try {
+                    const message: any = { type: "discord_message", author, content, tickSync: targetTick >= 0, syncGroup };
+                    if (targetTick >= 0) message.targetTick = targetTick;
+                    ws.send(JSON.stringify(message));
+                } catch (e) {
+                    console.error(`[MinecraftChat] Error sending to ${client.name}:`, e);
+                }
+            }
+        }
+    }
 }
 
 function flushDelayedMessages() {
@@ -614,83 +621,62 @@ function flushDelayedMessages() {
     
     while (delayedMessages.length > 0) {
         const msg = delayedMessages.shift()!;
-        sendToMinecraftWithSyncGroups(msg.author, msg.content, msg.channelId, msg.messageId, syncGroupTargetTicks);
+        if (msg.targetClientIds?.length) {
+            sendToTargetClients(msg.author, msg.content, msg.targetClientIds, syncGroupTargetTicks);
+        } else {
+            sendToMinecraftWithSyncGroups(msg.author, msg.content, msg.channelId, msg.messageId, syncGroupTargetTicks);
+        }
     }
 }
 
 function sendToMinecraftWithSyncGroups(
-    author: string, 
-    content: string, 
-    channelId: string, 
-    messageId?: string,
-    syncGroupTargetTicks?: Map<string, number>
+    author: string, content: string, channelId: string, 
+    messageId?: string, syncGroupTargetTicks?: Map<string, number>
 ) {
-    const clients = getClients();
-    const matchingClients = clients.filter(c => c.channelId === channelId && c.enabled);
-    
+    const matchingClients = getClients().filter(c => c.channelId === channelId && c.enabled);
     if (matchingClients.length === 0) return;
     
     const clientsBySyncGroup = new Map<string, ClientConfig[]>();
     for (const client of matchingClients) {
         const group = client.syncGroup || "A";
-        if (!clientsBySyncGroup.has(group)) {
-            clientsBySyncGroup.set(group, []);
-        }
+        if (!clientsBySyncGroup.has(group)) clientsBySyncGroup.set(group, []);
         clientsBySyncGroup.get(group)!.push(client);
     }
     
     for (const [syncGroup, groupClients] of clientsBySyncGroup) {
-        let targetTick: number;
-        if (syncGroupTargetTicks && syncGroupTargetTicks.has(syncGroup)) {
-            targetTick = syncGroupTargetTicks.get(syncGroup)!;
-        } else {
-            targetTick = calculateTargetTickForSyncGroup(syncGroup);
-            if (syncGroupTargetTicks) {
-                syncGroupTargetTicks.set(syncGroup, targetTick);
-            }
-        }
+        let targetTick = syncGroupTargetTicks?.get(syncGroup) ?? calculateTargetTickForSyncGroup(syncGroup);
+        syncGroupTargetTicks?.set(syncGroup, targetTick);
         
         for (const client of groupClients) {
             const ws = wsConnections.get(client.id);
-            if (ws && ws.readyState === WebSocket.OPEN) {
+            if (ws?.readyState === WebSocket.OPEN) {
                 try {
-                    const message: any = {
-                        type: "discord_message",
-                        author: author,
-                        content: content,
-                        tickSync: targetTick >= 0,
-                        syncGroup: syncGroup,
-                    };
+                    const message: any = { type: "discord_message", author, content, tickSync: targetTick >= 0, syncGroup };
                     if (messageId) message.messageId = messageId;
                     if (targetTick >= 0) message.targetTick = targetTick;
                     ws.send(JSON.stringify(message));
                 } catch (e) {
-                    console.error(`[MinecraftChat] Error sending message to ${client.name}:`, e);
+                    console.error(`[MinecraftChat] Error sending to ${client.name}:`, e);
                 }
             }
         }
     }
 }
 
-function queueDelayedMessage(author: string, content: string, channelId: string, messageId?: string) {
-    delayedMessages.push({ author, content, channelId, messageId });
+function queueDelayedMessage(author: string, content: string, channelId: string, messageId?: string, targetClientIds?: string[]) {
+    delayedMessages.push({ author, content, channelId, messageId, targetClientIds });
     log(`Message queued (${delayedMessages.length} in queue)`);
 }
 
 function clearDelayedMessages() {
-    const count = delayedMessages.length;
+    log(`Cleared ${delayedMessages.length} delayed message(s)`);
     delayedMessages.length = 0;
-    log(`Cleared ${count} delayed message(s)`);
 }
 
 function handleMessageSend(event: any) {
     if (event.nonce) {
         sentMessageNonces.add(event.nonce);
-        if (sentMessageNonces.size > 1000) {
-            const noncesArray = Array.from(sentMessageNonces);
-            sentMessageNonces.clear();
-            noncesArray.slice(-500).forEach(nonce => sentMessageNonces.add(nonce));
-        }
+        pruneSet(sentMessageNonces, 500);
     }
 }
 
@@ -709,11 +695,7 @@ function handleDiscordMessage(event: any) {
     
     if (messageId) {
         processedDiscordMessageIds.add(messageId);
-        if (processedDiscordMessageIds.size > 1000) {
-            const idsArray = Array.from(processedDiscordMessageIds);
-            processedDiscordMessageIds.clear();
-            idsArray.slice(-500).forEach(id => processedDiscordMessageIds.add(id));
-        }
+        pruneSet(processedDiscordMessageIds, 500);
     }
     
     if (message.nonce && sentMessageNonces.has(message.nonce)) {
@@ -756,7 +738,6 @@ function handleDiscordMessage(event: any) {
     sendToMinecraft(authorName, messageContent, channelId, messageId);
 }
 
-// Settings modal content - reuses the ClientsManager component
 function SettingsModalContent({ onClose }: { onClose: () => void }) {
     const [clients, setClients] = useState<ClientConfig[]>(getClients());
     const [statusRefresh, setStatusRefresh] = useState(0);
@@ -811,10 +792,8 @@ function SettingsModalContent({ onClose }: { onClose: () => void }) {
     useEffect(() => {
         const statusInterval = setInterval(() => {
             setStatusRefresh(prev => prev + 1);
-            // Sync state with settings and global variables
             setChatDelay(chatDelayEnabled);
             setDelayedCount(delayedMessages.length);
-            // Sync advanced features toggle with settings
             if (advancedFeatures !== settings.store.advancedFeatures) {
                 setAdvancedFeatures(settings.store.advancedFeatures);
             }
@@ -1147,12 +1126,10 @@ function SettingsModalContent({ onClose }: { onClose: () => void }) {
     );
 }
 
-// Automations Manager Component
 function AutomationsManager({ clients }: { clients: ClientConfig[] }) {
     const [automations, setAutomations] = useState<AutomationConfig[]>(getAutomations());
     
     useEffect(() => {
-        // Sync with storage periodically
         const interval = setInterval(() => {
             const current = getAutomations();
             if (JSON.stringify(current) !== JSON.stringify(automations)) {
@@ -1189,6 +1166,16 @@ function AutomationsManager({ clients }: { clients: ClientConfig[] }) {
         const updated = automations.map(a => a.id === id ? { ...a, ...updates } : a);
         saveAutomations(updated);
         setAutomations(updated);
+    };
+
+    const runAutomationManually = (id: string) => {
+        const automation = automations.find(a => a.id === id);
+        if (!automation) {
+            log(`Automation not found: ${id}`);
+            return;
+        }
+        log(`Manually running automation: "${automation.name}"`);
+        executeAutomationActions(automation, "manual");
     };
 
     const addAction = (automationId: string, actionType: AutomationAction["type"]) => {
@@ -1296,12 +1283,21 @@ function AutomationsManager({ clients }: { clients: ClientConfig[] }) {
                                 }}
                             />
                         </div>
-                        <button 
-                            onClick={() => removeAutomation(automation.id)} 
-                            style={{ padding: "4px 12px", color: "#fff", backgroundColor: "#ed4245", border: "none", borderRadius: "4px", cursor: "pointer", fontSize: "12px" }}
-                        >
-                            Remove
-                        </button>
+                        <div style={{ display: "flex", gap: "8px" }}>
+                            <button 
+                                onClick={() => runAutomationManually(automation.id)} 
+                                style={{ padding: "4px 12px", color: "#fff", backgroundColor: "#5865f2", border: "none", borderRadius: "4px", cursor: "pointer", fontSize: "12px" }}
+                                title="Run this automation manually"
+                            >
+                                ▶ Run
+                            </button>
+                            <button 
+                                onClick={() => removeAutomation(automation.id)} 
+                                style={{ padding: "4px 12px", color: "#fff", backgroundColor: "#ed4245", border: "none", borderRadius: "4px", cursor: "pointer", fontSize: "12px" }}
+                            >
+                                Remove
+                            </button>
+                        </div>
                     </div>
                     
                     {/* Client Selection */}
@@ -1651,7 +1647,6 @@ function AutomationsManager({ clients }: { clients: ClientConfig[] }) {
     );
 }
 
-// Open the settings modal
 function openSettingsModal() {
     openModal(props => (
         <ModalRoot {...props} size={ModalSize.MEDIUM}>
@@ -1666,9 +1661,7 @@ function openSettingsModal() {
     ));
 }
 
-// Chat bar button component
 const MinecraftChatButton: ChatBarButton = () => {
-    // Check if current channel has any connected clients
     const [hasConnection, setHasConnection] = useState(false);
     const [isDelayActive, setIsDelayActive] = useState(chatDelayEnabled);
     const [queueCount, setQueueCount] = useState(delayedMessages.length);
@@ -1703,7 +1696,7 @@ const MinecraftChatButton: ChatBarButton = () => {
         >
             <div style={{ position: "relative", display: "flex", alignItems: "center", justifyContent: "center" }}>
                 <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style={{ color: buttonColor }}>
-                    <path fill="currentColor" d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+                    <path fill="currentColor" d={GEAR_ICON_PATH}/>
                 </svg>
                 {isDelayActive && (
                     <div style={{
@@ -1730,26 +1723,18 @@ export default definePlugin({
 
     start() {
         log("Plugin starting...");
-
-        // Add chat bar button
         addChatBarButton("MinecraftChat", MinecraftChatButton);
 
-        // Subscribe to Discord message events (only once)
         if (!isSubscribed) {
             FluxDispatcher.subscribe("MESSAGE_CREATE", handleDiscordMessage);
             FluxDispatcher.subscribe("MESSAGE_SEND", handleMessageSend);
             isSubscribed = true;
         }
 
-        // Connect to all enabled clients if auto-connect is enabled
         if (settings.store.autoConnect) {
             setTimeout(() => {
                 const clients = getClients();
-                for (const client of clients) {
-                    if (client.enabled) {
-                        connectWebSocket(client);
-                    }
-                }
+                clients.filter(c => c.enabled).forEach(connectWebSocket);
             }, 2000);
         }
 
@@ -1758,30 +1743,23 @@ export default definePlugin({
 
     stop() {
         log("Plugin stopping...");
-
-        // Remove chat bar button
         removeChatBarButton("MinecraftChat");
 
-        // Unsubscribe from Discord message events
         if (isSubscribed) {
             FluxDispatcher.unsubscribe("MESSAGE_CREATE", handleDiscordMessage);
             FluxDispatcher.unsubscribe("MESSAGE_SEND", handleMessageSend);
             isSubscribed = false;
         }
 
-        // Clear tracked data
         sentMessageNonces.clear();
         processedDiscordMessageIds.clear();
         forwardedToDiscordMessages.clear();
         disconnectMessageSent.clear();
-
-        // Disconnect all WebSockets
         disconnectAllWebSockets();
 
         log("Plugin stopped!");
     },
 
-    // Settings panel component - minimal status with gear icon to open settings
     settingsAboutComponent: () => {
         const [hasConnection, setHasConnection] = useState(false);
         const [clientCount, setClientCount] = useState(0);
@@ -1848,7 +1826,7 @@ export default definePlugin({
                         title="Open Client Settings"
                     >
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" style={{ color: "#b5bac1" }}>
-                            <path fill="currentColor" d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 0 0-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/>
+                            <path fill="currentColor" d={GEAR_ICON_PATH}/>
                         </svg>
                     </button>
                 </div>
@@ -1856,32 +1834,19 @@ export default definePlugin({
         );
     },
 
-    // Expose functions for manual control
     toolboxActions: {
-        "Connect All Clients": () => {
-            const clients = getClients();
-            for (const client of clients) {
-                if (client.enabled) {
-                    connectWebSocket(client);
-                }
-            }
-        },
-        "Disconnect All Clients": () => {
-            disconnectAllWebSockets();
-        },
+        "Connect All Clients": () => getClients().filter(c => c.enabled).forEach(connectWebSocket),
+        "Disconnect All Clients": disconnectAllWebSockets,
         "Check Connection Status": () => {
             const clients = getClients();
             log(`${clients.length} client(s) configured`);
-            for (const client of clients) {
+            clients.forEach(client => {
                 const ws = wsConnections.get(client.id);
-                const status = ws?.readyState;
-                const statusText =
-                    status === WebSocket.CONNECTING ? "Connecting" :
-                    status === WebSocket.OPEN ? "Connected" :
-                    status === WebSocket.CLOSING ? "Closing" :
-                    "Disconnected";
+                const statusText = ws?.readyState === WebSocket.CONNECTING ? "Connecting" :
+                    ws?.readyState === WebSocket.OPEN ? "Connected" :
+                    ws?.readyState === WebSocket.CLOSING ? "Closing" : "Disconnected";
                 log(`${client.name} (port ${client.port}, channel ${client.channelId}): ${statusText}`);
-            }
+            });
         },
     },
 });
