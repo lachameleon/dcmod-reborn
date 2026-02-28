@@ -3,10 +3,13 @@ package discord.chat.mc;
 import discord.chat.mc.chat.ChatHandler;
 import discord.chat.mc.command.DiscordCommand;
 import discord.chat.mc.config.ModConfig;
+import discord.chat.mc.relay.RelayInboundPoller;
+import discord.chat.mc.relay.RelayService;
 import discord.chat.mc.websocket.DiscordWebSocketServer;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
 import net.fabricmc.fabric.api.client.networking.v1.ClientPlayConnectionEvents;
+import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.Component;
 
@@ -20,8 +23,12 @@ public class DiscordChatIntegrationClient implements ClientModInitializer {
 		ModConfig config = ModConfig.getInstance();
 		DiscordCommand.register();
 		
-		ClientLifecycleEvents.CLIENT_STARTED.register(client -> startWebSocketServer(config.getPort()));
+		ClientLifecycleEvents.CLIENT_STARTED.register(client -> {
+			startWebSocketServer(config.getPort());
+			RelayInboundPoller.getInstance().start();
+		});
 		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> {
+			RelayInboundPoller.getInstance().stop();
 			stopWebSocketServer();
 			ChatHandler.getInstance().shutdown();
 		});
@@ -34,8 +41,33 @@ public class DiscordChatIntegrationClient implements ClientModInitializer {
 		Minecraft client = Minecraft.getInstance();
 		if (client == null || client.player == null) return;
 		
+		String playerName = client.player.getName().getString();
+		String playerUuid = client.player.getUUID() != null ? client.player.getUUID().toString() : null;
+		boolean isMultiplayer = !client.isSingleplayer();
+		ServerData currentServer = client.getCurrentServer();
+		String serverAddress = (currentServer != null && currentServer.ip != null) ? currentServer.ip : null;
+		
+		RelayService.getInstance().relaySessionJoin(playerName, isMultiplayer, serverAddress, playerUuid, null);
+		
 		client.execute(() -> {
 			DiscordWebSocketServer server = DiscordWebSocketServer.getInstance();
+			ModConfig config = ModConfig.getInstance();
+			if (config.isRelayEnabled()) {
+				String relayStatus = String.format(
+					"§6[Discord Relay] §aActive§7 | URL: §f%s",
+					config.getRelayUrl()
+				);
+				client.player.displayClientMessage(Component.literal(relayStatus), false);
+				if (server != null && server.isRunning() && server.getConnectionCount() > 0) {
+					String wsStatus = String.format(
+						"§6[Discord WS] §aConnected§7 | Port: §f%d§7 | Clients: §f%d",
+						server.getPort(), server.getConnectionCount()
+					);
+					client.player.displayClientMessage(Component.literal(wsStatus), false);
+				}
+				return;
+			}
+			
 			if (server != null && server.isRunning() && server.getConnectionCount() > 0) {
 				String status = String.format(
 					"§6[Discord Chat] §7Status: §aConnected§7 | Port: §f%d§7 | Clients: §f%d",
@@ -43,7 +75,6 @@ public class DiscordChatIntegrationClient implements ClientModInitializer {
 				);
 				client.player.displayClientMessage(Component.literal(status), false);
 			} else {
-				ModConfig config = ModConfig.getInstance();
 				client.player.displayClientMessage(Component.literal("§6[Discord Chat] §7Status: §cDisconnected"), false);
 				client.player.displayClientMessage(
 					Component.literal(String.format("§7Warning: Client(s) may be offline or port §f%d§7 may be taken", config.getPort())), false);

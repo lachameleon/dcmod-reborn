@@ -150,7 +150,7 @@ public class DiscordWebSocketServer extends WebSocketServer {
                 } catch (Exception ignored) {}
                 
                 try {
-                    String name = client.player.getGameProfile().getName();
+                    String name = client.player.getGameProfile().name();
                     if (name != null && !name.isEmpty() && !name.equals("Player")) return name;
                 } catch (Exception ignored) {}
             }

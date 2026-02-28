@@ -10,6 +10,8 @@
 
 module.exports = class MinecraftChat {
     constructor() {
+        this.DEFAULT_RELAY_URL = "https://discordrelay.lacha.dev/relay";
+        this.RELAY_SOURCE_ID_KEY = "minecraft-chat-relay-source-id";
         this.defaultSettings = {
             autoConnect: true,
             connectionLoggingChannel: "",
@@ -41,6 +43,7 @@ module.exports = class MinecraftChat {
         this.runningAutomations = new Map();
         this.automationInstanceCounter = 0;
         this.TICK_SYNC_BUFFER = 5;
+        this.relaySourceId = this.getOrCreateRelaySourceId();
         
         // Cached webpack modules
         this._modules = null;
@@ -113,6 +116,18 @@ module.exports = class MinecraftChat {
     }
 
     saveSettings() { BdApi.Data.save(this.getName(), "settings", this.settings); }
+    
+    getOrCreateRelaySourceId() {
+        try {
+            const existing = globalThis.localStorage?.getItem(this.RELAY_SOURCE_ID_KEY);
+            if (existing && existing.trim()) return existing;
+            const created = `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+            globalThis.localStorage?.setItem(this.RELAY_SOURCE_ID_KEY, created);
+            return created;
+        } catch {
+            return `ephemeral-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+        }
+    }
     
     getClients() {
         try { return JSON.parse(this.settings.clientProperties || "[]"); }
@@ -359,6 +374,27 @@ module.exports = class MinecraftChat {
         const nonce = `${Date.now()}${Math.floor(Math.random() * 1000)}`;
         this.sentMessageNonces.add(nonce);
         await this.sendDiscordMessage(logChannelId, content, nonce);
+    }
+    
+    async publishDiscordRelayMessage(author, content, channelId, messageId) {
+        if (!author?.trim() || !content?.trim()) return;
+        try {
+            await fetch(this.DEFAULT_RELAY_URL, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    type: "discord_message",
+                    author,
+                    message: content,
+                    channelId,
+                    messageId,
+                    sourceClientId: this.relaySourceId,
+                    timestamp: new Date().toISOString()
+                })
+            });
+        } catch (e) {
+            this.log("Relay publish failed:", e);
+        }
     }
 
     getConnectedClientsList() {
@@ -648,6 +684,9 @@ module.exports = class MinecraftChat {
         if (!messageContent) return;
 
         const authorName = author?.username || "Unknown";
+        if (!message.webhook_id) {
+            this.publishDiscordRelayMessage(authorName, messageContent, channelId, messageId);
+        }
         if (this.chatDelayEnabled) {
             this.queueDelayedMessage(authorName, messageContent, channelId, messageId);
             return;
@@ -1382,4 +1421,3 @@ module.exports = class MinecraftChat {
             </div>`;
     }
 };
-

@@ -8,7 +8,7 @@
 
 ## What It Does
 
-This mod bridges Discord and Minecraft through a local WebSocket connection, allowing you to send messages and execute commands in Minecraft directly from Discord without any bots. It also includes other advanced features like chat delay and automations.
+This mod bridges Discord and Minecraft through a local WebSocket connection, allowing you to send messages and execute commands in Minecraft directly from Discord without any bots. It also includes a built-in HTTP relay (enabled by default) that posts Minecraft chat to Discord through the hosted bot relay.
 
 - **Botless Discord Integration** - No Discord bot setup required; uses Vencord or BetterDiscord plugins
 - **Bidirectional Chat** - Send messages/commands from Discord to Minecraft and receive chat feedback in Discord
@@ -16,11 +16,13 @@ This mod bridges Discord and Minecraft through a local WebSocket connection, all
 - **[Sync Groups](#sync-groups)** - Achieve tick-perfect synchronization across multiple Minecraft clients
 - **[Chat Delay](#chat-delay)** - Queue and batch-send messages
 - **[Automations](#automations)** - Create trigger-based rules that execute actions when Minecraft chat events occur
+- **Relay Forwarding (Default)** - Sends Minecraft chat to `https://discordrelay.lacha.dev/relay` out of the box
+- **Relay Feed (Default)** - Shows relay-fed Discord messages and other clients' chat in-game
 
 ## Requirements
 
-- **Minecraft**: 1.21.4 - 1.21.10
-- **Fabric Loader**: 0.18.1 or higher
+- **Minecraft**: 1.21.11
+- **Fabric Loader**: 0.18.4 or higher
 - **Fabric API**: Latest version for 1.21.x
 - **Java**: 21 or higher
 - **Discord**: Latest MinecraftChat Vencord/BetterDiscord plugin
@@ -28,7 +30,8 @@ This mod bridges Discord and Minecraft through a local WebSocket connection, all
 ---
 
 > [!IMPORTANT]
-> Both the Discord plugin and the mod are required to be installed.
+> Relay forwarding (Minecraft chat -> Discord bot relay channel) works with just the mod.
+> Install the Discord plugin too if you want bidirectional Discord -> Minecraft control.
 
 ---
 
@@ -57,6 +60,18 @@ This mod bridges Discord and Minecraft through a local WebSocket connection, all
 4. The plugin will automatically connect (if "Auto Connect" is enabled and the port number matches)
 5. Send messages/commands in the configured Discord channel, they'll appear/execute in Minecraft chat
 6. Recieve messages or command feedback in Discord (If "Forward to Discord" is enabled)
+
+### Relay-First Quick Start (Default)
+
+1. Install and launch the mod on Minecraft `1.21.11`
+2. Join a world/server
+3. Run `/discordchat relay status`
+4. Confirm relay is enabled and URL is `https://discordrelay.lacha.dev/relay`
+5. Send Minecraft chat messages; they will be relayed to Discord through the Vercel relay
+6. Messages relayed by other clients are shown in-game as `[DCI Relay]` entries
+
+> [!NOTE]
+> Discord messages are now read directly by the relay bot from the configured channel, so plugin-side relay publishing is optional.
 
 ## Setup and Configurations
 
@@ -213,6 +228,32 @@ Shows:
 
 This command is particularly useful when using [Sync Groups](#sync-groups) to verify that messages from multiple clients are executing at the correct game ticks.
 
+#### `/discordchat relay ...`
+Configures HTTP relay forwarding from the mod to an external server (for example, `vercel/relay`):
+- `/discordchat relay status` - Shows relay settings
+- `/discordchat relay enable|disable` - Toggles relay
+- `/discordchat relay url <http(s)://...>` - Sets relay endpoint
+- `/discordchat relay token <token>` - Sets bearer token for relay auth
+- `/discordchat relay token clear` - Clears relay token
+- `/discordchat relay timeout <1000-30000>` - Sets HTTP timeout in milliseconds
+
+#### `/discordchat ratelimit [messagesPerMinute]`
+Shows or sets Discord-originated send rate limits (default `45` per minute, range `1-600`).
+
+#### `/discordchat send <message>`
+Sends a normal chat message to the Minecraft server only and bypasses relay forwarding to Vercel/Discord.
+
+#### `/toggle`
+Client-side command that switches plain chat destination between:
+- **Discord relay only**
+- **Minecraft server only**
+
+#### Discord message behavior
+- Messages starting with `/` are treated as Minecraft commands.
+- Use `/send <message>` from Discord to force a normal chat message instead of command execution.
+- Plain in-game chat input (without command prefix) follows the `/toggle` mode when relay mode is enabled.
+- `/discordchat send <message>` always sends to Minecraft server only and does not relay to Discord.
+
 ## Building from Source
 
 ### Prerequisites
@@ -237,4 +278,4 @@ This command is particularly useful when using [Sync Groups](#sync-groups) to ve
    ./gradlew build
    ```
    
-Output JARs are in `build/libs/` (1.21.1 - 1.21.10)
+Output JARs are in `build/libs/` (1.21.11)
