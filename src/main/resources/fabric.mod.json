@@ -5,12 +5,13 @@
 	"name": "Discord Chat Integration",
 	"description": "Send Minecraft commands/messages from Discord",
 	"authors": [
-		"Aurick"
+		"Aurick",
+		"lachameleon"
 	],
 	"contact": {
-		"homepage": "https://github.com/aurickk/Discord-Chat-Integration/",
-		"sources": "https://github.com/aurickk/Discord-Chat-Integration/",
-		"issues": "https://github.com/aurickk/Discord-Chat-Integration/issues"
+		"homepage": "https://github.com/lachameleon/dcmod-reborn",
+		"sources": "https://github.com/lachameleon/dcmod-reborn",
+		"issues": "https://github.com/lachameleon/dcmod-reborn/issues"
 	},
 	"icon": "assets/discord-chat-integration/icon.png",
 	"environment": "*",
